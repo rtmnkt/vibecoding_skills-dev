@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pyyaml"]
+# dependencies = ["pyyaml", "duckdb"]
 # ///
 """
 Requirements state management CLI.
@@ -19,20 +19,19 @@ Commands:
     regress <req_file> <req_no> --detail TEXT [--criteria-id ID]
     status [req_file]
     migrate [req_file]
+    req add <file> <text>
+    req list [file]
+    spec add <requirement> <title> --body TEXT [--commits ...] [--files ...]
 """
 
+from __future__ import annotations
+
 import argparse
-import hashlib
 import io
-import json
 import os
 import re
-import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-
-import yaml
 
 # Force UTF-8 output on Windows
 if sys.platform == "win32":
@@ -40,108 +39,14 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-def _find_repo_root() -> Path:
-    """Find repository root via git, with fallback to .git directory walk."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return Path(result.stdout.strip())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    # Fallback: walk up from this file looking for .git
-    p = Path(__file__).resolve().parent
-    while p != p.parent:
-        if (p / ".git").exists():
-            return p
-        p = p.parent
-    print("✗ Cannot find repository root", file=sys.stderr)
-    sys.exit(1)
-
-
-REPO_ROOT = _find_repo_root()
-LOCAL_DIR = REPO_ROOT / ".local"
-STATE_DIR = LOCAL_DIR / "state"
-REQUIREMENTS_DIR = LOCAL_DIR / "requirements"
-CRITERIA_FILE = STATE_DIR / "acceptance_criteria.jsonl"
-VERIFICATIONS_FILE = STATE_DIR / "verifications.jsonl"
-APPROVALS_FILE = STATE_DIR / "approvals.jsonl"
-
-
-# ---------------------------------------------------------------------------
-# Core I/O
-# ---------------------------------------------------------------------------
-
-
-def ensure_state_dir():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    for f in (CRITERIA_FILE, VERIFICATIONS_FILE, APPROVALS_FILE):
-        if not f.exists():
-            f.touch()
-
-
-def read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    entries = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            entries.append(json.loads(line))
-    return entries
-
-
-def append_jsonl(path: Path, entry: dict):
-    with path.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-
-def next_id(path: Path, prefix: str) -> str:
-    entries = read_jsonl(path)
-    max_n = 0
-    for e in entries:
-        eid = e.get("id", "")
-        if eid.startswith(f"{prefix}-"):
-            try:
-                n = int(eid[len(prefix) + 1 :])
-                max_n = max(max_n, n)
-            except ValueError:
-                pass
-    return f"{prefix}-{max_n + 1}"
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-
-
-# ---------------------------------------------------------------------------
-# Requirement file parsing
-# ---------------------------------------------------------------------------
-
-
-def parse_requirement_body(path: Path) -> dict[int, str]:
-    """Parse requirement body, returning {req_no: first_line_text}."""
-    text = path.read_text(encoding="utf-8-sig")
-    # Skip frontmatter
-    if text.startswith("---"):
-        end = text.find("---", 3)
-        if end != -1:
-            text = text[end + 3 :]
-    result = {}
-    for m in re.finditer(r"^(\d+)\.\s+(.+)$", text, re.MULTILINE):
-        result[int(m.group(1))] = m.group(2).strip()
-    return result
+import state_db
 
 
 def extract_front_matter(text: str) -> dict | None:
+    import yaml
+
     match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
     if not match:
         return None
@@ -156,49 +61,45 @@ def resolve_req_file(name: str) -> Path:
     """Resolve requirement file by number (e.g. '0001') or path."""
     if not name.endswith(".md"):
         name = f"{name}.md"
-    p = REQUIREMENTS_DIR / name
+    p = state_db.get_paths().requirements_dir / name
     if not p.exists():
         print(f"✗ Requirement file not found: {p}", file=sys.stderr)
         sys.exit(1)
     return p
 
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
-
-def cmd_criteria_add(args):
-    ensure_state_dir()
+def cmd_criteria_add(args) -> None:
+    state_db.ensure_state_dir()
     req_path = resolve_req_file(args.req_file)
-    req_no = args.req_no
-    criterion = args.criterion
-
-    body = parse_requirement_body(req_path)
-    req_text = body.get(req_no)
-    if req_text is None:
+    body = state_db.parse_requirement_body(req_path)
+    if args.req_no not in body:
         print(
-            f"✗ Requirement {req_no} not found in {req_path.name}", file=sys.stderr
+            f"✗ Requirement {args.req_no} not found in {req_path.name}",
+            file=sys.stderr,
         )
         sys.exit(1)
 
-    new_id = next_id(CRITERIA_FILE, "ac")
-    entry = {
-        "id": new_id,
-        "requirement": req_path.stem,
-        "req_no": req_no,
-        "criterion": criterion,
-        "req_text_hash": hash_text(req_text),
-        "created_at": now_iso(),
-        "created_by": getattr(args, "by", "agent") or "agent",
-    }
-    append_jsonl(CRITERIA_FILE, entry)
-    print(f"✓ Added {new_id}: [{req_path.stem}#{req_no}] {criterion}")
+    try:
+        entry = state_db.add_criteria(
+            req_path.stem,
+            args.req_no,
+            args.criterion,
+            getattr(args, "by", "agent") or "agent",
+        )
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(
+        f"✓ Added {entry['id']}: "
+        f"[{entry['requirement']}#{entry['req_no']}] {entry['criterion']}"
+    )
 
 
-def cmd_criteria_list(args):
-    ensure_state_dir()
-    criteria = read_jsonl(CRITERIA_FILE)
+def cmd_criteria_list(args) -> None:
+    state_db.ensure_state_dir()
+    p = state_db.get_paths()
+    criteria = state_db.read_jsonl(p.criteria_file)
 
     if args.req_file:
         req_name = args.req_file.replace(".md", "")
@@ -212,11 +113,11 @@ def cmd_criteria_list(args):
 
     for c in criteria:
         stale = ""
-        req_path = REQUIREMENTS_DIR / f"{c['requirement']}.md"
+        req_path = p.requirements_dir / f"{c['requirement']}.md"
         if req_path.exists():
-            body = parse_requirement_body(req_path)
+            body = state_db.parse_requirement_body(req_path)
             current_text = body.get(c["req_no"], "")
-            if hash_text(current_text) != c.get("req_text_hash", ""):
+            if state_db.hash_text(current_text) != c.get("req_text_hash", ""):
                 stale = " ⚠️ stale"
         print(
             f"  {c['id']}: [{c['requirement']}#{c['req_no']}] "
@@ -224,206 +125,131 @@ def cmd_criteria_list(args):
         )
 
 
-def cmd_verify(args):
-    ensure_state_dir()
-    criteria = read_jsonl(CRITERIA_FILE)
-    target = next((c for c in criteria if c["id"] == args.criteria_id), None)
-    if target is None:
-        print(f"✗ Criteria {args.criteria_id} not found", file=sys.stderr)
-        sys.exit(1)
-
-    if args.status not in ("passed", "failed", "conditional"):
-        print(
-            f"✗ Invalid status '{args.status}'. Use: passed, failed, conditional",
-            file=sys.stderr,
+def cmd_verify(args) -> None:
+    state_db.ensure_state_dir()
+    try:
+        entry = state_db.verify(
+            args.criteria_id,
+            args.status,
+            args.detail or "",
+            args.limitation or "",
+            args.by or "agent",
         )
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
         sys.exit(1)
 
-    new_id = next_id(VERIFICATIONS_FILE, "v")
-    entry = {
-        "id": new_id,
-        "criteria_id": args.criteria_id,
-        "requirement": target["requirement"],
-        "req_no": target["req_no"],
-        "status": args.status,
-        "detail": args.detail or "",
-        "limitation": args.limitation or "",
-        "verified_at": now_iso(),
-        "verified_by": args.by or "agent",
-    }
-    append_jsonl(VERIFICATIONS_FILE, entry)
     print(
-        f"✓ Recorded {new_id}: {args.criteria_id} → {args.status}"
+        f"✓ Recorded {entry['id']}: {args.criteria_id} → {args.status}"
         + (f" ({args.limitation})" if args.limitation else "")
     )
 
 
-def cmd_approve(args):
-    ensure_state_dir()
-    verifications = read_jsonl(VERIFICATIONS_FILE)
-    target = next((v for v in verifications if v["id"] == args.verification_id), None)
-    if target is None:
-        print(
-            f"✗ Verification {args.verification_id} not found", file=sys.stderr
-        )
+def cmd_approve(args) -> None:
+    state_db.ensure_state_dir()
+    try:
+        state_db.approve(args.verification_id, args.decision, args.comment or "")
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
         sys.exit(1)
-
-    if args.decision not in ("approved", "rejected"):
-        print(
-            f"✗ Invalid decision '{args.decision}'. Use: approved, rejected",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    new_id = next_id(APPROVALS_FILE, "a")
-    entry = {
-        "id": new_id,
-        "verification_id": args.verification_id,
-        "decision": args.decision,
-        "comment": args.comment or "",
-        "decided_at": now_iso(),
-    }
-    append_jsonl(APPROVALS_FILE, entry)
     print(f"✓ {args.decision.capitalize()} {args.verification_id}")
 
 
-def cmd_regress(args):
-    ensure_state_dir()
+def cmd_regress(args) -> None:
+    state_db.ensure_state_dir()
     req_path = resolve_req_file(args.req_file)
-    req_no = args.req_no
-
-    # Find criteria for this req_no, or create default
-    criteria = read_jsonl(CRITERIA_FILE)
+    p = state_db.get_paths()
+    criteria = state_db.read_jsonl(p.criteria_file)
     matching = [
         c
         for c in criteria
-        if c["requirement"] == req_path.stem and c["req_no"] == req_no
+        if c["requirement"] == req_path.stem and c["req_no"] == args.req_no
     ]
 
-    criteria_id = ""
     if args.criteria_id:
-        # Explicit criteria ID — validate it exists
         target = next((c for c in criteria if c["id"] == args.criteria_id), None)
         if target is None:
             print(f"✗ Criteria {args.criteria_id} not found", file=sys.stderr)
             sys.exit(1)
-        if target["requirement"] != req_path.stem or target["req_no"] != req_no:
+        if target["requirement"] != req_path.stem or target["req_no"] != args.req_no:
             print(
                 f"✗ Criteria {args.criteria_id} belongs to "
-                f"{target['requirement']}#{target['req_no']}, not {req_path.stem}#{req_no}",
+                f"{target['requirement']}#{target['req_no']}, "
+                f"not {req_path.stem}#{args.req_no}",
                 file=sys.stderr,
             )
             sys.exit(1)
-        criteria_id = args.criteria_id
-    elif matching:
-        if len(matching) > 1:
-            print(
-                f"✗ Multiple criteria for {req_path.stem}#{req_no}. "
-                f"Specify one with --criteria-id:",
-                file=sys.stderr,
-            )
-            for c in matching:
-                print(f"  {c['id']}: {c['criterion']}", file=sys.stderr)
-            sys.exit(1)
-        criteria_id = matching[0]["id"]
-    else:
-        # Auto-create default criterion
-        body = parse_requirement_body(req_path)
-        req_text = body.get(req_no, f"Requirement {req_no}")
-        cid = next_id(CRITERIA_FILE, "ac")
-        c_entry = {
-            "id": cid,
-            "requirement": req_path.stem,
-            "req_no": req_no,
-            "criterion": req_text,
-            "req_text_hash": hash_text(req_text),
-            "created_at": now_iso(),
-            "created_by": "migration",
-        }
-        append_jsonl(CRITERIA_FILE, c_entry)
-        criteria_id = cid
-        print(f"  (auto-created {cid} from requirement text)")
-
-    new_id = next_id(VERIFICATIONS_FILE, "v")
-    entry = {
-        "id": new_id,
-        "criteria_id": criteria_id,
-        "requirement": req_path.stem,
-        "req_no": req_no,
-        "status": "regression",
-        "detail": args.detail,
-        "limitation": "",
-        "verified_at": now_iso(),
-        "verified_by": args.by or "agent",
-    }
-    append_jsonl(VERIFICATIONS_FILE, entry)
-    print(f"✓ Regression {new_id}: [{req_path.stem}#{req_no}] {args.detail}")
-
-
-def cmd_status(args):
-    ensure_state_dir()
-    criteria = read_jsonl(CRITERIA_FILE)
-    verifications = read_jsonl(VERIFICATIONS_FILE)
-    approvals = read_jsonl(APPROVALS_FILE)
-
-    # Index approvals by verification_id (latest wins)
-    approval_map: dict[str, dict] = {}
-    for a in approvals:
-        approval_map[a["verification_id"]] = a
-
-    # Index verifications by criteria_id (latest wins)
-    verif_map: dict[str, dict] = {}
-    for v in verifications:
-        cid = v.get("criteria_id", "")
-        if cid:
-            verif_map[cid] = v
-
-    # Group criteria by requirement
-    req_criteria: dict[str, list[dict]] = {}
-    for c in criteria:
-        req_criteria.setdefault(c["requirement"], []).append(c)
-
-    # Determine which requirements to show
-    if args.req_file:
-        req_names = [args.req_file.replace(".md", "")]
-    else:
-        req_names = sorted(
-            set(c["requirement"] for c in criteria)
-            | set(
-                p.stem
-                for p in REQUIREMENTS_DIR.glob("*.md")
-                if p.stem != "0000"
-            )
+    elif len(matching) > 1:
+        print(
+            f"✗ Multiple criteria for {req_path.stem}#{args.req_no}. "
+            f"Specify one with --criteria-id:",
+            file=sys.stderr,
         )
+        for c in matching:
+            print(f"  {c['id']}: {c['criterion']}", file=sys.stderr)
+        sys.exit(1)
+
+    auto_created = not args.criteria_id and not matching
+    try:
+        entry = state_db.regress(
+            req_path.stem,
+            args.req_no,
+            args.detail,
+            args.criteria_id,
+            args.by or "agent",
+        )
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if auto_created:
+        print(f"  (auto-created {entry['criteria_id']} from requirement text)")
+    print(f"✓ Regression {entry['id']}: [{req_path.stem}#{args.req_no}] {args.detail}")
+
+
+def cmd_status(args) -> None:
+    state_db.ensure_state_dir()
+    rows = state_db.query_full_status(args.req_file)
+    summary = state_db.compute_summary(rows)
+
+    requirements = state_db.list_requirements(args.req_file)
+    requirements_by_file: dict[str, list[dict]] = {}
+    for req in requirements:
+        requirements_by_file.setdefault(req["file"], []).append(req)
+    for reqs in requirements_by_file.values():
+        reqs.sort(key=lambda r: r["req_no"])
+
+    rows_by_key: dict[tuple[str, int], list[dict]] = {}
+    for row in rows:
+        rows_by_key.setdefault((row["requirement"], row["req_no"]), []).append(row)
+
+    req_names = (
+        [args.req_file.replace(".md", "")]
+        if args.req_file
+        else sorted(requirements_by_file.keys())
+    )
 
     total_reqs = 0
     with_criteria = 0
-    verified_approved = 0
-    verified_pending = 0
-    failed_count = 0
-    regression_count = 0
     no_criteria = 0
 
     for req_name in req_names:
-        req_path = REQUIREMENTS_DIR / f"{req_name}.md"
-        if not req_path.exists():
+        req_items = requirements_by_file.get(req_name, [])
+        if not req_items:
             continue
-        body = parse_requirement_body(req_path)
-        my_criteria = req_criteria.get(req_name, [])
-        criteria_by_reqno: dict[int, list[dict]] = {}
-        for c in my_criteria:
-            criteria_by_reqno.setdefault(c["req_no"], []).append(c)
 
         print(f"\n{'=' * 50}")
         print(f"  {req_name}.md")
         print(f"{'=' * 50}")
 
-        for req_no in sorted(body.keys()):
+        for req in req_items:
+            req_no = req["req_no"]
+            req_text = req["text"]
             total_reqs += 1
-            req_text = body[req_no]
+
             print(f"\n  {req_no}. {req_text}")
 
-            clist = criteria_by_reqno.get(req_no, [])
+            clist = rows_by_key.get((req_name, req_no), [])
             if not clist:
                 no_criteria += 1
                 print("      ❓ No acceptance criteria defined")
@@ -431,59 +257,40 @@ def cmd_status(args):
 
             with_criteria += 1
             for c in clist:
-                stale = ""
-                if hash_text(body.get(c["req_no"], "")) != c.get(
-                    "req_text_hash", ""
-                ):
-                    stale = " ⚠️ STALE"
-
-                v = verif_map.get(c["id"])
-                if v is None:
-                    print(
-                        f"      📋 {c['id']}: {c['criterion']}{stale}"
-                    )
+                stale = " ⚠️ STALE" if c.get("is_stale") else ""
+                if c.get("v_id") is None:
+                    print(f"      📋 {c['criteria_id']}: {c['criterion']}{stale}")
                     print("         ❓ Not yet verified")
+                    continue
+
+                status_icon = {
+                    "passed": "✅",
+                    "failed": "❌",
+                    "conditional": "⚠️",
+                    "regression": "🔴",
+                }.get(c["v_status"], "❓")
+
+                if c.get("a_decision") == "approved":
+                    approval_text = " — approved"
+                elif c.get("a_decision"):
+                    approval_text = f" — rejected: {c.get('a_comment', '')}"
                 else:
-                    a = approval_map.get(v["id"])
-                    status_icon = {
-                        "passed": "✅",
-                        "failed": "❌",
-                        "conditional": "⚠️",
-                        "regression": "🔴",
-                    }.get(v["status"], "❓")
+                    approval_text = " — pending review"
 
-                    approval_text = ""
-                    if a:
-                        if a["decision"] == "approved":
-                            approval_text = " — approved"
-                            verified_approved += 1
-                        else:
-                            approval_text = f" — rejected: {a.get('comment', '')}"
-                    else:
-                        approval_text = " — pending review"
-                        verified_pending += 1
-
-                    if v["status"] == "failed":
-                        failed_count += 1
-                    elif v["status"] == "regression":
-                        regression_count += 1
-
-                    print(
-                        f"      📋 {c['id']}: {c['criterion']}{stale}"
+                print(f"      📋 {c['criteria_id']}: {c['criterion']}{stale}")
+                detail_str = (
+                    f" ({c['v_limitation']})"
+                    if c.get("v_limitation")
+                    else (
+                        f" ({c['v_detail'][:60]})"
+                        if c.get("v_detail")
+                        else ""
                     )
-                    detail_str = (
-                        f" ({v['limitation']})"
-                        if v.get("limitation")
-                        else (
-                            f" ({v['detail'][:60]})"
-                            if v.get("detail")
-                            else ""
-                        )
-                    )
-                    print(
-                        f"         {status_icon} {v['id']}: "
-                        f"{v['status']}{detail_str}{approval_text}"
-                    )
+                )
+                print(
+                    f"         {status_icon} {c['v_id']}: "
+                    f"{c['v_status']}{detail_str}{approval_text}"
+                )
 
     print(f"\n{'─' * 50}")
     print(
@@ -492,30 +299,54 @@ def cmd_status(args):
         f"No criteria: {no_criteria}"
     )
     print(
-        f"  Approved: {verified_approved}  |  "
-        f"Pending review: {verified_pending}  |  "
-        f"Failed: {failed_count}  |  "
-        f"Regressions: {regression_count}"
+        f"  Approved: {summary['approved']}  |  "
+        f"Pending review: {summary['pending'] + summary['regression']}  |  "
+        f"Failed: {summary['failed']}  |  "
+        f"Regressions: {summary['regression']}"
     )
     print(f"{'─' * 50}")
 
 
-def cmd_migrate(args):
-    ensure_state_dir()
+def cmd_req_add(args) -> None:
+    state_db.ensure_state_dir()
+    entry = state_db.add_requirement(args.file, args.text, args.by or "user")
+    print(f"✓ Added {entry['id']}: [{entry['file']}#{entry['req_no']}] {entry['text']}")
+
+
+def cmd_req_list(args) -> None:
+    state_db.ensure_state_dir()
+    reqs = state_db.list_requirements(args.file)
+    if not reqs:
+        print("(no requirements found)")
+        return
+    for r in reqs:
+        print(f"  {r['id']}: [{r['file']}#{r['req_no']}] {r['text']}")
+
+
+def cmd_spec_add(args) -> None:
+    state_db.ensure_state_dir()
+    entry = state_db.add_spec(
+        args.requirement,
+        args.title,
+        args.body,
+        args.commits,
+        args.files,
+        args.by or "agent",
+    )
+    print(f"✓ Added {entry['id']}: [{entry['requirement']}] {entry['title']}")
+
+
+def cmd_migrate(args) -> None:
+    state_db.ensure_state_dir()
+    p = state_db.get_paths()
 
     if args.req_file:
         files = [resolve_req_file(args.req_file)]
     else:
-        files = sorted(
-            p
-            for p in REQUIREMENTS_DIR.glob("*.md")
-            if p.stem != "0000"
-        )
+        files = sorted(md for md in p.requirements_dir.glob("*.md") if md.stem != "0000")
 
-    existing_criteria = read_jsonl(CRITERIA_FILE)
-    existing_reqs = {
-        (c["requirement"], c["req_no"]) for c in existing_criteria
-    }
+    existing_criteria = state_db.read_jsonl(p.criteria_file)
+    existing_reqs = {(c["requirement"], c["req_no"]) for c in existing_criteria}
 
     total_criteria = 0
     total_verifications = 0
@@ -533,12 +364,11 @@ def cmd_migrate(args):
             print(f"  ⏭ {req_path.name}: passed_stutas is empty")
             continue
 
-        body = parse_requirement_body(req_path)
+        body = state_db.parse_requirement_body(req_path)
         req_name = req_path.stem
 
         print(f"\n  Migrating {req_path.name}...")
 
-        # Collect all entries sorted by date
         date_entries: list[tuple[str, int, str]] = []
         for date_key, entries in ps.items():
             if isinstance(date_key, __import__("datetime").date):
@@ -557,40 +387,34 @@ def cmd_migrate(args):
                     status_str = str(status_raw)
                     date_entries.append((date_str, req_no, status_str))
 
-        # Sort by date, then req_no
         date_entries.sort(key=lambda x: (x[0], x[1]))
-
-        # Track criteria we create per req_no
         created_criteria: dict[int, str] = {}
 
         for date_str, req_no, status_str in date_entries:
-            # Create criterion if not exists
             if (req_name, req_no) not in existing_reqs and req_no not in created_criteria:
                 req_text = body.get(req_no, f"Requirement {req_no}")
-                cid = next_id(CRITERIA_FILE, "ac")
+                cid = state_db.next_id(p.criteria_file, "ac")
                 c_entry = {
                     "id": cid,
                     "requirement": req_name,
                     "req_no": req_no,
                     "criterion": req_text,
-                    "req_text_hash": hash_text(req_text),
+                    "req_text_hash": state_db.hash_text(req_text),
                     "created_at": f"{date_str}T00:00:00+00:00",
                     "created_by": "migration",
                 }
-                append_jsonl(CRITERIA_FILE, c_entry)
+                state_db.append_jsonl(p.criteria_file, c_entry)
                 created_criteria[req_no] = cid
                 existing_reqs.add((req_name, req_no))
                 total_criteria += 1
 
             criteria_id = created_criteria.get(req_no, "")
             if not criteria_id:
-                # Find existing criteria
-                for c in read_jsonl(CRITERIA_FILE):
+                for c in state_db.read_jsonl(p.criteria_file):
                     if c["requirement"] == req_name and c["req_no"] == req_no:
                         criteria_id = c["id"]
                         break
 
-            # Determine status and detail
             is_regression = status_str.startswith("REGRESSION:")
             if is_regression:
                 v_status = "regression"
@@ -601,12 +425,11 @@ def cmd_migrate(args):
                 v_detail = ""
                 v_limitation = ""
             else:
-                # Conditional or detailed pass
                 v_status = "conditional"
                 v_detail = status_str
                 v_limitation = status_str
 
-            vid = next_id(VERIFICATIONS_FILE, "v")
+            vid = state_db.next_id(p.verifications_file, "v")
             v_entry = {
                 "id": vid,
                 "criteria_id": criteria_id,
@@ -618,33 +441,32 @@ def cmd_migrate(args):
                 "verified_at": f"{date_str}T00:00:00+00:00",
                 "verified_by": "migration",
             }
-            append_jsonl(VERIFICATIONS_FILE, v_entry)
+            state_db.append_jsonl(p.verifications_file, v_entry)
             total_verifications += 1
 
-            # Auto-approve only "passed" entries (conditional/regression need user review)
             if v_status == "passed":
-                aid = next_id(APPROVALS_FILE, "a")
+                aid = state_db.next_id(p.approvals_file, "a")
                 a_entry = {
                     "id": aid,
                     "verification_id": vid,
                     "decision": "approved",
                     "comment": "auto-approved (migration)",
-                    "decided_at": now_iso(),
+                    "decided_at": state_db.now_iso(),
                 }
-                append_jsonl(APPROVALS_FILE, a_entry)
+                state_db.append_jsonl(p.approvals_file, a_entry)
                 total_approvals += 1
 
         print(f"    ✓ {req_path.name} done")
+
+    req_mig = state_db.migrate_requirements_md()
+    spec_mig = state_db.migrate_specs_md()
 
     print(f"\n  Migration complete:")
     print(f"    Criteria created: {total_criteria}")
     print(f"    Verifications created: {total_verifications}")
     print(f"    Auto-approvals created: {total_approvals}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+    print(f"    Requirements migrated: {req_mig['migrated']}")
+    print(f"    Specs migrated: {spec_mig['migrated']}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -654,7 +476,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # criteria
     crit = sub.add_parser("criteria", help="Manage acceptance criteria")
     crit_sub = crit.add_subparsers(dest="crit_action", required=True)
 
@@ -668,41 +489,63 @@ def build_parser() -> argparse.ArgumentParser:
     crit_list.add_argument("req_file", nargs="?", help="Filter by file")
     crit_list.add_argument("--req-no", type=int, help="Filter by req number")
 
-    # verify
     ver = sub.add_parser("verify", help="Record verification result")
     ver.add_argument("criteria_id", help="Criteria ID (e.g. ac-1)")
     ver.add_argument(
-        "status", choices=["passed", "failed", "conditional"],
+        "status",
+        choices=["passed", "failed", "conditional"],
         help="Verification status",
     )
     ver.add_argument("--detail", help="Verification detail")
     ver.add_argument("--limitation", help="Limitation for conditional status")
     ver.add_argument("--by", default="agent", help="Verifier name")
 
-    # approve
     appr = sub.add_parser("approve", help="Approve/reject a verification")
     appr.add_argument("verification_id", help="Verification ID (e.g. v-1)")
     appr.add_argument(
-        "decision", choices=["approved", "rejected"],
+        "decision",
+        choices=["approved", "rejected"],
         help="Approval decision",
     )
     appr.add_argument("--comment", help="Comment")
 
-    # regress
     reg = sub.add_parser("regress", help="Record regression")
     reg.add_argument("req_file", help="Requirement file (e.g. 0001)")
     reg.add_argument("req_no", type=int, help="Requirement number")
     reg.add_argument("--detail", required=True, help="Regression detail")
-    reg.add_argument("--criteria-id", help="Target criteria ID (required when multiple criteria exist)")
+    reg.add_argument(
+        "--criteria-id",
+        help="Target criteria ID (required when multiple criteria exist)",
+    )
     reg.add_argument("--by", default="agent", help="Reporter name")
 
-    # status
     st = sub.add_parser("status", help="Show verification status")
     st.add_argument("req_file", nargs="?", help="Filter by file")
 
-    # migrate
     mig = sub.add_parser("migrate", help="Migrate from frontmatter")
     mig.add_argument("req_file", nargs="?", help="Specific file to migrate")
+
+    req = sub.add_parser("req", help="Manage requirements")
+    req_sub = req.add_subparsers(dest="req_action", required=True)
+
+    req_add = req_sub.add_parser("add", help="Add requirement")
+    req_add.add_argument("file", help="Requirement file (e.g. 0001)")
+    req_add.add_argument("text", help="Requirement text")
+    req_add.add_argument("--by", default="user", help="Creator")
+
+    req_list = req_sub.add_parser("list", help="List requirements")
+    req_list.add_argument("file", nargs="?", help="Filter by file")
+
+    spec = sub.add_parser("spec", help="Manage specs")
+    spec_sub = spec.add_subparsers(dest="spec_action", required=True)
+
+    spec_add = spec_sub.add_parser("add", help="Add spec")
+    spec_add.add_argument("requirement", help="Requirement file (e.g. 0001)")
+    spec_add.add_argument("title", help="Spec title")
+    spec_add.add_argument("--body", required=True, help="Spec body")
+    spec_add.add_argument("--commits", nargs="*", help="Related commits")
+    spec_add.add_argument("--files", nargs="*", help="Related files")
+    spec_add.add_argument("--by", default="agent", help="Creator")
 
     return parser
 
@@ -727,7 +570,21 @@ def main() -> int:
             cmd_status(args)
         elif args.command == "migrate":
             cmd_migrate(args)
+        elif args.command == "req":
+            if args.req_action == "add":
+                cmd_req_add(args)
+            elif args.req_action == "list":
+                cmd_req_list(args)
+        elif args.command == "spec":
+            if args.spec_action == "add":
+                cmd_spec_add(args)
         return 0
+    except RuntimeError as e:
+        if str(e) == "Cannot find repository root":
+            print("✗ Cannot find repository root", file=sys.stderr)
+            return 1
+        print(f"✗ Error: {e}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"✗ Error: {e}", file=sys.stderr)
         return 1

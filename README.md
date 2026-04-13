@@ -19,3 +19,11 @@ uv run .github/skills/req-driven-dev/req_tool.py criteria add ...       # 受け
 uv run .github/skills/req-driven-dev/req_tool.py verify ...             # 検証結果記録
 uv run .github/skills/req-driven-dev/validate.py                        # フォーマット検証
 ```
+
+### WebUI ダッシュボード
+
+```bash
+uv run .github/skills/req-driven-dev/webui.py                          # http://localhost:9421
+```
+
+要件の進捗サマリー、検証状態の承認/却下、依存関係の Mermaid 可視化を提供。
