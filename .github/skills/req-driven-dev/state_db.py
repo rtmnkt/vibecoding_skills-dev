@@ -766,7 +766,7 @@ def migrate_requirements_md() -> dict[str, int]:
 
 
 def migrate_specs_md() -> dict[str, int]:
-    """Migrate specs from .specs/*.md to specs.jsonl."""
+    """Migrate legacy spec markdown files into state storage."""
     p = _get_paths()
     ensure_state_dir()
 

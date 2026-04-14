@@ -6,9 +6,9 @@
 Requirements / specs / state validator.
 
 Validates:
-  - .local/skills_req-driven-dev/*.jsonl  — JSONL schema validation (default)
-  - .local/requirements/*.md              — legacy body format (explicit only)
-  - .local/specs/*.md                     — legacy YAML front matter (explicit only)
+  - current state files                   — schema validation (default)
+  - legacy requirement markdown files     — body format (explicit only)
+  - legacy spec markdown files            — YAML front matter (explicit only)
 
 Usage:
     uv run .github/skills/req-driven-dev/validate.py          # validate JSONL state
@@ -80,7 +80,7 @@ def validate_requirement(path: Path) -> list[str]:
             if fm_text:
                 errors.append(
                     "Legacy frontmatter detected. "
-                    "Run 'uv run .github/skills/req-driven-dev/req_tool.py migrate' to move state to JSONL"
+                    "Run 'uv run .github/skills/req-driven-dev/req_tool.py migrate' to import legacy state"
                 )
             body = text[end + 3 :].strip()
 

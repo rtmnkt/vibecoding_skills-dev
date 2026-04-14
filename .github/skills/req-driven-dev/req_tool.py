@@ -361,7 +361,7 @@ def cmd_migrate(args) -> None:
         files = [_resolve_req_file_md(args.req_file)]
     else:
         if not p.requirements_dir.exists():
-            print("  ⏭ No .local/requirements/ directory found. Nothing to migrate.")
+            print("  ⏭ No legacy requirement files found. Nothing to migrate.")
             return
         files = sorted(p.requirements_dir.glob("*.md"))
 
