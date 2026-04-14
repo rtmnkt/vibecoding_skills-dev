@@ -20,32 +20,34 @@ argument-hint: '要件ファイル番号 (例: 0001) またはタスクの説明
 
 ## CLI ツール リファレンス
 
+以下のコマンド例は、skill root からの相対パスで記載する。
+
 ```bash
 # 状態確認（最初に必ず実行）
-uv run .github/skills/req-driven-dev/req_tool.py status [req_file]
+uv run scripts/req_tool.py status [req_file]
 
 # 受け入れ条件の管理
-uv run .github/skills/req-driven-dev/req_tool.py criteria add <req_file> <req_no> <criterion>
-uv run .github/skills/req-driven-dev/req_tool.py criteria list [req_file] [--req-no N]
+uv run scripts/req_tool.py criteria add <req_file> <req_no> <criterion>
+uv run scripts/req_tool.py criteria list [req_file] [--req-no N]
 
 # 検証結果の記録（受け入れ条件が存在する req_no のみ）
-uv run .github/skills/req-driven-dev/req_tool.py verify <criteria_id> <status> [--detail TEXT] [--limitation TEXT]
+uv run scripts/req_tool.py verify <criteria_id> <status> [--detail TEXT] [--limitation TEXT]
 
 # リグレッション記録
-uv run .github/skills/req-driven-dev/req_tool.py regress <req_file> <req_no> --detail TEXT [--criteria-id ID]
+uv run scripts/req_tool.py regress <req_file> <req_no> --detail TEXT [--criteria-id ID]
 
 # 承認（ユーザーが実行。エージェントは実行しない）
-uv run .github/skills/req-driven-dev/req_tool.py approve <verification_id> <decision> [--comment TEXT]
+uv run scripts/req_tool.py approve <verification_id> <decision> [--comment TEXT]
 
 # 要件の追加
-uv run .github/skills/req-driven-dev/req_tool.py req add <file> <text>
-uv run .github/skills/req-driven-dev/req_tool.py req list [file]
+uv run scripts/req_tool.py req add <file> <text>
+uv run scripts/req_tool.py req list [file]
 
 # 仕様メモの追加
-uv run .github/skills/req-driven-dev/req_tool.py spec add <requirement> <title> --body TEXT [--commits ...] [--files ...]
+uv run scripts/req_tool.py spec add <requirement> <title> --body TEXT [--commits ...] [--files ...]
 
 # マイグレーション（レガシー .md → 現行形式）
-uv run .github/skills/req-driven-dev/req_tool.py migrate [req_file]
+uv run scripts/req_tool.py migrate [req_file]
 ```
 
 status の値: `passed`, `failed`, `conditional`
@@ -56,7 +58,7 @@ decision の値: `approved`, `rejected`
 ブラウザベースのダッシュボード (NiceGUI)。検証状態の俯瞰、承認操作、要件追加が可能。
 
 ```bash
-uv run .github/skills/req-driven-dev/webui.py [--port PORT]
+uv run scripts/webui.py [--port PORT]
 # デフォルト: http://localhost:9421
 ```
 
@@ -82,8 +84,8 @@ uv run .github/skills/req-driven-dev/webui.py [--port PORT]
 
 ### Phase 1: 要件読解 + 現状把握
 
-1. `uv run .github/skills/req-driven-dev/req_tool.py req list XXXX` で要件一覧を確認
-2. `uv run .github/skills/req-driven-dev/req_tool.py status XXXX` を実行して現在の検証状態を確認
+1. `uv run scripts/req_tool.py req list XXXX` で要件一覧を確認
+2. `uv run scripts/req_tool.py status XXXX` を実行して現在の検証状態を確認
 3. 関連する仕様メモがあれば `commits` と `files` の git log を比較し、乖離があればコードと照合
 4. フォーマットが不明なら [要件フォーマット](./references/requirements-format.md) を確認
 
@@ -102,7 +104,7 @@ uv run .github/skills/req-driven-dev/webui.py [--port PORT]
 
 ```bash
 # 条件登録例
-uv run .github/skills/req-driven-dev/req_tool.py criteria add 0001 10 "BitBlt API で画面全体のスクリーンショットが取得できること"
+uv run scripts/req_tool.py criteria add 0001 10 "BitBlt API で画面全体のスクリーンショットが取得できること"
 ```
 
 **暗黙の要件を発見した場合:**
@@ -134,25 +136,25 @@ uv run .github/skills/req-driven-dev/req_tool.py criteria add 0001 10 "BitBlt AP
 
 ```bash
 # 検証結果の記録
-uv run .github/skills/req-driven-dev/req_tool.py verify ac-1 passed --detail "cargo test で全テスト通過"
-uv run .github/skills/req-driven-dev/req_tool.py verify ac-3 conditional --detail "背後ウィンドウOK" --limitation "最小化ウィンドウは不可"
-uv run .github/skills/req-driven-dev/req_tool.py verify ac-5 failed --detail "コンパイルエラー: xxx"
+uv run scripts/req_tool.py verify ac-1 passed --detail "cargo test で全テスト通過"
+uv run scripts/req_tool.py verify ac-3 conditional --detail "背後ウィンドウOK" --limitation "最小化ウィンドウは不可"
+uv run scripts/req_tool.py verify ac-5 failed --detail "コンパイルエラー: xxx"
 ```
 
 **注意:** `approve` コマンドはエージェントが実行するものではない。ユーザーが検証結果を確認して承認する。
 
 ### Phase 6: 報告 + 記録
 
-1. `uv run .github/skills/req-driven-dev/req_tool.py spec add` で仕様メモを追記
+1. `uv run scripts/req_tool.py spec add` で仕様メモを追記
 2. 他の仕様に影響する変更をした場合、該当仕様も更新
-3. `uv run .github/skills/req-driven-dev/req_tool.py status XXXX` で最終状態を表示
+3. `uv run scripts/req_tool.py status XXXX` で最終状態を表示
 
 ### リグレッション検出時
 
 既存の検証結果は残したまま、新しいリグレッション記録を追加する:
 
 ```bash
-uv run .github/skills/req-driven-dev/req_tool.py regress 0003 10 --detail "Aggregator状態マシン欠陥で連続変化中にイベント不発行"
+uv run scripts/req_tool.py regress 0003 10 --detail "Aggregator状態マシン欠陥で連続変化中にイベント不発行"
 ```
 
 ## Decision Points

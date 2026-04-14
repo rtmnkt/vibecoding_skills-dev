@@ -29,12 +29,12 @@
 
 ## 状態管理
 
-検証状態は CLI ツールで管理する:
+検証状態は CLI ツールで管理する。以下は skill root からの相対パス:
 
 ```bash
-uv run .github/skills/req-driven-dev/req_tool.py status XXXX       # 状態確認
-uv run .github/skills/req-driven-dev/req_tool.py criteria add ...   # 受け入れ条件追加
-uv run .github/skills/req-driven-dev/req_tool.py verify ...         # 検証結果記録
+uv run scripts/req_tool.py status XXXX      # 状態確認
+uv run scripts/req_tool.py criteria add ... # 受け入れ条件追加
+uv run scripts/req_tool.py verify ...       # 検証結果記録
 ```
 
 詳細は `req-driven-dev` スキルの SKILL.md を参照。

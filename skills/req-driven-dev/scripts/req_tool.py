@@ -9,7 +9,7 @@ This tool is the sole interface for managing requirement verification state.
 State is stored as JSONL files (sorted rewrite on each mutation).
 
 Usage:
-    uv run .github/skills/req-driven-dev/req_tool.py <command> [args...]
+    uv run scripts/req_tool.py <command> [args...]  # from this skill root
 
 Commands:
     criteria add <req_file> <req_no> <criterion>

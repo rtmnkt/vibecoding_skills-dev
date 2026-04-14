@@ -6,7 +6,7 @@
 req-driven-dev Web UI — NiceGUI dashboard for requirement tracking.
 
 Usage:
-    uv run .github/skills/req-driven-dev/webui.py [--port PORT]
+    uv run scripts/webui.py [--port PORT]  # from this skill root
 """
 from __future__ import annotations
 
