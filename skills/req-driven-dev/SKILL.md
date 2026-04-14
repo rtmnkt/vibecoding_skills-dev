@@ -6,7 +6,7 @@ description: >-
   Use when: 要件を実装する、要件を検証する、状態を確認する、
   specs を書く、リグレッション確認、"要件0001を対応して",
   "implement requirement", "verify requirements"
-argument-hint: '要件ファイル番号 (例: 0001) またはタスクの説明'
+argument-hint: '要件ファイル番号 (例: 0001) またはタスクの説明、またはwebui'
 ---
 
 # Requirements-Driven Development
@@ -56,6 +56,8 @@ decision の値: `approved`, `rejected`
 ## Web UI ダッシュボード
 
 ブラウザベースのダッシュボード (NiceGUI)。検証状態の俯瞰、承認操作、要件追加が可能。
+この skill には WebUI 起動機能がある。
+現在の指示が `webui`, `web ui`, `dashboard`, `open dashboard`, `start webui` のような内容であれば、次のスクリプトを実行する。
 
 ```bash
 uv run scripts/webui.py [--port PORT]
