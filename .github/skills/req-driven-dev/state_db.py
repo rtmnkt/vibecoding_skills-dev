@@ -226,8 +226,6 @@ def query_full_status(req_file: str | None = None) -> list[dict]:
     # Fallback: load from legacy .md files for any missing
     if p.requirements_dir.exists():
         for md_file in p.requirements_dir.glob("*.md"):
-            if md_file.stem == "0000":
-                continue
             body = parse_requirement_body(md_file)
             for req_no, text in body.items():
                 key = (md_file.stem, req_no)
@@ -346,8 +344,6 @@ def query_specs() -> list[dict]:
     if p.specs_dir.exists():
         existing_reqs = {s.get("requirement") for s in specs}
         for md_file in sorted(p.specs_dir.glob("*.md")):
-            if md_file.stem == "0000":
-                continue
             fm = parse_spec_frontmatter(md_file)
             if fm and fm["requirement"] not in existing_reqs:
                 specs.append(
@@ -509,8 +505,6 @@ def list_requirements(file: str | None = None) -> list[dict]:
     existing_keys = {(r["file"], r["req_no"]) for r in reqs}
     if p.requirements_dir.exists():
         for md_file in sorted(p.requirements_dir.glob("*.md")):
-            if md_file.stem == "0000":
-                continue
             body = parse_requirement_body(md_file)
             for req_no, text in sorted(body.items()):
                 key = (md_file.stem, req_no)
@@ -574,8 +568,7 @@ def list_requirement_files() -> list[str]:
         files.add(r["file"])
     if p.requirements_dir.exists():
         for md in p.requirements_dir.glob("*.md"):
-            if md.stem != "0000":
-                files.add(md.stem)
+            files.add(md.stem)
     return sorted(files)
 
 
@@ -809,8 +802,6 @@ def migrate_requirements_md() -> dict[str, int]:
         return {"migrated": 0}
 
     for md_file in sorted(p.requirements_dir.glob("*.md")):
-        if md_file.stem == "0000":
-            continue
         body = parse_requirement_body(md_file)
         for req_no, text in sorted(body.items()):
             key = (md_file.stem, req_no)
@@ -843,8 +834,6 @@ def migrate_specs_md() -> dict[str, int]:
         return {"migrated": 0}
 
     for md_file in sorted(p.specs_dir.glob("*.md")):
-        if md_file.stem == "0000":
-            continue
         fm = parse_spec_frontmatter(md_file)
         if not fm:
             continue

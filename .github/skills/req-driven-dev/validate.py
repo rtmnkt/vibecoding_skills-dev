@@ -220,9 +220,6 @@ def main() -> int:
             paths.extend(sorted(state_dir.glob("*.jsonl")))
 
     for path in paths:
-        if path.stem == "0000":
-            continue
-
         parent = path.parent.name
         if parent == "requirements":
             errs = validate_requirement(path)
@@ -244,10 +241,7 @@ def main() -> int:
                 print(f"  {filepath}: {e}", file=sys.stderr)
         return 1
     else:
-        validated = sum(
-            1 for p in paths if p.stem != "0000"
-            and (p.parent.name in ("requirements", "specs", "state"))
-        )
+        validated = sum(1 for p in paths if p.parent.name in ("requirements", "specs", "state"))
         print(f"✓ {validated} file(s) valid.")
         return 0
 

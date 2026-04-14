@@ -343,7 +343,7 @@ def cmd_migrate(args) -> None:
     if args.req_file:
         files = [resolve_req_file(args.req_file)]
     else:
-        files = sorted(md for md in p.requirements_dir.glob("*.md") if md.stem != "0000")
+        files = sorted(p.requirements_dir.glob("*.md"))
 
     existing_criteria = state_db.read_jsonl(p.criteria_file)
     existing_reqs = {(c["requirement"], c["req_no"]) for c in existing_criteria}
