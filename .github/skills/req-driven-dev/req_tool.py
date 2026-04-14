@@ -6,7 +6,7 @@
 Requirements state management CLI.
 
 This tool is the sole interface for managing requirement verification state.
-State is stored as append-only JSONL files.
+State is stored as JSONL files (sorted rewrite on each mutation).
 
 Usage:
     uv run .github/skills/req-driven-dev/req_tool.py <command> [args...]
@@ -489,6 +489,19 @@ def cmd_migrate(args) -> None:
     print(f"    Specs migrated: {spec_mig['migrated']}")
 
 
+def cmd_validate(args) -> None:
+    errors = state_db.validate_state()
+    if not errors:
+        print("✓ All state files valid.")
+        return
+    total = sum(len(e) for e in errors.values())
+    print(f"✗ {total} error(s) in {len(errors)} file(s):", file=sys.stderr)
+    for source, errs in sorted(errors.items()):
+        for e in errs:
+            print(f"  {source}: {e}", file=sys.stderr)
+    sys.exit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="req_tool",
@@ -567,6 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     spec_add.add_argument("--files", nargs="*", help="Related files")
     spec_add.add_argument("--by", default="agent", help="Creator")
 
+    sub.add_parser("validate", help="Validate state files")
+
     return parser
 
 
@@ -598,6 +613,8 @@ def main() -> int:
         elif args.command == "spec":
             if args.spec_action == "add":
                 cmd_spec_add(args)
+        elif args.command == "validate":
+            cmd_validate(args)
         return 0
     except RuntimeError as e:
         if str(e) == "Cannot find repository root":

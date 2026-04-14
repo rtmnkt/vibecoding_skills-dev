@@ -1,8 +1,13 @@
 """
 Shared data layer for req-driven-dev skill.
 
-Provides DuckDB-based reads, JSONL writes, and migration helpers.
+Provides DuckDB-based reads, JSONL writes (sorted rewrite), and migration helpers.
 Used by both req_tool.py (CLI) and webui.py (NiceGUI).
+
+Architecture:
+  - JSONL files are the durable source of truth (git-tracked).
+  - Each operation loads JSONL → in-memory DuckDB → processes → rewrites JSONL sorted.
+  - Schemas defined in schema.py; DuckDB tables created with explicit DDL.
 
 This is a regular Python module (not a uv script).
 Callers must have duckdb in their dependencies.
@@ -12,14 +17,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import duckdb
+
+import schema as _schema
 
 
 # ---------------------------------------------------------------------------
@@ -131,17 +141,12 @@ def append_jsonl(path: Path, entry: dict) -> None:
 
 
 def next_id(path: Path, prefix: str) -> str:
-    entries = read_jsonl(path)
-    max_n = 0
-    for e in entries:
-        eid = e.get("id", "")
-        if eid.startswith(f"{prefix}-"):
-            try:
-                n = int(eid[len(prefix) + 1 :])
-                max_n = max(max_n, n)
-            except ValueError:
-                pass
-    return f"{prefix}-{max_n + 1}"
+    """Generate a UUID-based ID with the given prefix.
+
+    Format: ``prefix-<12 hex chars>`` (e.g. ``req-a1b2c3d4e5f6``).
+    Branch-safe: independent branches won't collide.
+    """
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
 def now_iso() -> str:
@@ -205,6 +210,78 @@ def _duckdb_path(p: Path) -> str:
     return str(p).replace("\\", "/")
 
 
+def _load_table(con: duckdb.DuckDBPyConnection, table_name: str, path: Path) -> None:
+    """Load a JSONL file into an in-memory DuckDB table with explicit schema.
+
+    Empty files (0 bytes) produce a correctly-typed empty table.
+    """
+    dp = _duckdb_path(path)
+    cols = _schema.duckdb_columns(table_name)
+
+    if not path.exists() or path.stat().st_size == 0:
+        con.execute(_schema.duckdb_ddl(table_name))
+    else:
+        col_spec = ", ".join(f"'{k}': '{v}'" for k, v in cols.items())
+        con.execute(
+            f"CREATE TABLE {table_name} AS "
+            f"SELECT * FROM read_json('{dp}', "
+            f"format='newline_delimited', columns={{{col_spec}}})"
+        )
+
+
+def _save_table(con: duckdb.DuckDBPyConnection, table_name: str, path: Path) -> None:
+    """Write a DuckDB table back to JSONL, sorted deterministically.
+
+    Uses temp file + atomic rename for crash safety.
+    """
+    sort_cols = _schema.SORT_KEYS.get(table_name, ["id"])
+    order_clause = ", ".join(sort_cols)
+
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), suffix=".jsonl.tmp", prefix=f".{table_name}_"
+    )
+    os.close(fd)
+    tmp_dp = _duckdb_path(Path(tmp))
+
+    try:
+        con.execute(
+            f"COPY (SELECT * FROM {table_name} ORDER BY {order_clause}) "
+            f"TO '{tmp_dp}' (FORMAT JSON, ARRAY false)"
+        )
+        os.replace(tmp, str(path))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _file_hash(path: Path) -> str:
+    """Return hex SHA-256 of file contents (empty string for missing/empty)."""
+    if not path.exists() or path.stat().st_size == 0:
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _append_and_save(table_name: str, path: Path, entry: dict) -> None:
+    """Append *entry* to the JSONL file using the rewrite strategy.
+
+    Steps: load existing data → INSERT new row → COPY sorted to file.
+    """
+    con = duckdb.connect(":memory:")
+    try:
+        _load_table(con, table_name, path)
+        cols = list(entry.keys())
+        placeholders = ", ".join("?" for _ in cols)
+        col_names = ", ".join(cols)
+        con.execute(
+            f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})",
+            list(entry.values()),
+        )
+        _save_table(con, table_name, path)
+    finally:
+        con.close()
+
+
 def query_full_status(req_file: str | None = None) -> list[dict]:
     """
     Query full status by joining all 5 JSONL files via DuckDB.
@@ -223,41 +300,40 @@ def query_full_status(req_file: str | None = None) -> list[dict]:
     for r in read_jsonl(p.requirements_file):
         req_texts[(r["file"], r["req_no"])] = r["text"]
 
-    # DuckDB query: join criteria + latest verification + latest approval
-    criteria_path = _duckdb_path(p.criteria_file)
-    verif_path = _duckdb_path(p.verifications_file)
-    approv_path = _duckdb_path(p.approvals_file)
-
-    sql = f"""
-    WITH latest_v AS (
-        SELECT *
-        FROM read_json_auto('{verif_path}')
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY criteria_id ORDER BY verified_at DESC
-        ) = 1
-    ),
-    latest_a AS (
-        SELECT *
-        FROM read_json_auto('{approv_path}')
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY verification_id ORDER BY decided_at DESC
-        ) = 1
-    )
-    SELECT
-        c.id as criteria_id, c.requirement, c.req_no,
-        c.criterion, c.req_text_hash,
-        v.id as v_id, v.status as v_status,
-        v.detail as v_detail, v.limitation as v_limitation,
-        v.verified_at,
-        a.decision as a_decision, a.comment as a_comment
-    FROM read_json_auto('{criteria_path}') c
-    LEFT JOIN latest_v v ON v.criteria_id = c.id
-    LEFT JOIN latest_a a ON a.verification_id = v.id
-    ORDER BY c.requirement, c.req_no
-    """
-
+    con = duckdb.connect(":memory:")
     try:
-        con = duckdb.connect(":memory:")
+        _load_table(con, "acceptance_criteria", p.criteria_file)
+        _load_table(con, "verifications", p.verifications_file)
+        _load_table(con, "approvals", p.approvals_file)
+
+        sql = """
+        WITH latest_v AS (
+            SELECT *
+            FROM verifications
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY criteria_id ORDER BY verified_at DESC, id DESC
+            ) = 1
+        ),
+        latest_a AS (
+            SELECT *
+            FROM approvals
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY verification_id ORDER BY decided_at DESC, id DESC
+            ) = 1
+        )
+        SELECT
+            c.id as criteria_id, c.requirement, c.req_no,
+            c.criterion, c.req_text_hash,
+            v.id as v_id, v.status as v_status,
+            v.detail as v_detail, v.limitation as v_limitation,
+            v.verified_at,
+            a.decision as a_decision, a.comment as a_comment
+        FROM acceptance_criteria c
+        LEFT JOIN latest_v v ON v.criteria_id = c.id
+        LEFT JOIN latest_a a ON a.verification_id = v.id
+        ORDER BY c.requirement, c.req_no
+        """
+
         rows = con.execute(sql).fetchall()
         columns = [
             "criteria_id",
@@ -291,11 +367,9 @@ def query_full_status(req_file: str | None = None) -> list[dict]:
             req_name = req_file.replace(".md", "")
             result = [r for r in result if r["requirement"] == req_name]
 
-        con.close()
         return result
-    except duckdb.IOException:
-        # Empty JSONL files — DuckDB can't read them
-        return []
+    finally:
+        con.close()
 
 
 def compute_summary(rows: list[dict]) -> dict[str, int]:
@@ -502,7 +576,7 @@ def add_requirement(file: str, text: str, by: str = "user") -> dict:
         "created_at": now_iso(),
         "created_by": by,
     }
-    append_jsonl(p.requirements_file, entry)
+    _append_and_save("requirements", p.requirements_file, entry)
     return entry
 
 
@@ -543,7 +617,7 @@ def add_spec(
         "created_at": now_iso(),
         "created_by": by,
     }
-    append_jsonl(p.specs_file, entry)
+    _append_and_save("specs", p.specs_file, entry)
     return entry
 
 
@@ -580,7 +654,7 @@ def add_criteria(
         "created_at": now_iso(),
         "created_by": by,
     }
-    append_jsonl(p.criteria_file, entry)
+    _append_and_save("acceptance_criteria", p.criteria_file, entry)
     return entry
 
 
@@ -615,7 +689,7 @@ def verify(
         "verified_at": now_iso(),
         "verified_by": by,
     }
-    append_jsonl(p.verifications_file, entry)
+    _append_and_save("verifications", p.verifications_file, entry)
     return entry
 
 
@@ -646,7 +720,7 @@ def approve(
         "comment": comment,
         "decided_at": now_iso(),
     }
-    append_jsonl(p.approvals_file, entry)
+    _append_and_save("approvals", p.approvals_file, entry)
     return entry
 
 
@@ -709,7 +783,7 @@ def regress(
             "created_at": now_iso(),
             "created_by": "auto",
         }
-        append_jsonl(p.criteria_file, c_entry)
+        _append_and_save("acceptance_criteria", p.criteria_file, c_entry)
         target_cid = cid
 
     new_id = next_id(p.verifications_file, "v")
@@ -724,7 +798,7 @@ def regress(
         "verified_at": now_iso(),
         "verified_by": by,
     }
-    append_jsonl(p.verifications_file, entry)
+    _append_and_save("verifications", p.verifications_file, entry)
     return entry
 
 
@@ -758,7 +832,7 @@ def migrate_requirements_md() -> dict[str, int]:
                     "created_at": now_iso(),
                     "created_by": "migration",
                 }
-                append_jsonl(p.requirements_file, entry)
+                _append_and_save("requirements", p.requirements_file, entry)
                 existing.add(key)
                 count += 1
 
@@ -794,8 +868,120 @@ def migrate_specs_md() -> dict[str, int]:
             "created_at": now_iso(),
             "created_by": "migration",
         }
-        append_jsonl(p.specs_file, entry)
+        _append_and_save("specs", p.specs_file, entry)
         existing.add(fm["requirement"])
         count += 1
 
     return {"migrated": count}
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+def validate_state() -> dict[str, list[str]]:
+    """Validate all JSONL state files against the canonical schema.
+
+    Returns ``{filename: [error_messages]}`` — empty dict means all valid.
+    """
+    p = _get_paths()
+    ensure_state_dir()
+
+    file_map: dict[str, tuple[str, Path]] = {
+        "requirements.jsonl": ("requirements", p.requirements_file),
+        "acceptance_criteria.jsonl": ("acceptance_criteria", p.criteria_file),
+        "verifications.jsonl": ("verifications", p.verifications_file),
+        "approvals.jsonl": ("approvals", p.approvals_file),
+        "specs.jsonl": ("specs", p.specs_file),
+    }
+
+    all_errors: dict[str, list[str]] = {}
+
+    # Per-file validation
+    ids_by_table: dict[str, set[str]] = {}
+    for filename, (table_name, path) in file_map.items():
+        errors: list[str] = []
+        schema_cols = _schema.TABLE_SCHEMAS[table_name]
+        required = _schema.required_fields(table_name)
+        entries = read_jsonl(path)
+        ids_seen: set[str] = set()
+
+        # Composite key tracking
+        composite_keys_seen: dict[tuple[str, ...], set[tuple]] = {}
+        for key_fields in _schema.UNIQUE_KEYS.get(table_name, []):
+            composite_keys_seen[key_fields] = set()
+
+        for line_no, entry in enumerate(entries, 1):
+            # Field presence + type
+            for col in schema_cols:
+                if col.name not in entry:
+                    if col.required:
+                        errors.append(f"Line {line_no}: missing required field '{col.name}'")
+                else:
+                    expected = _schema.python_type_for(col.logical_type)
+                    if not isinstance(entry[col.name], expected):
+                        errors.append(
+                            f"Line {line_no}: '{col.name}' expected "
+                            f"{col.logical_type}, got {type(entry[col.name]).__name__}"
+                        )
+
+            # ID uniqueness
+            eid = entry.get("id", "")
+            if eid in ids_seen:
+                errors.append(f"Line {line_no}: duplicate ID '{eid}'")
+            ids_seen.add(eid)
+
+            # Composite key uniqueness
+            for key_fields, seen in composite_keys_seen.items():
+                key_val = tuple(entry.get(k) for k in key_fields)
+                if all(v is not None for v in key_val):
+                    if key_val in seen:
+                        errors.append(
+                            f"Line {line_no}: duplicate key {dict(zip(key_fields, key_val))}"
+                        )
+                    seen.add(key_val)
+
+            # Enum checks
+            if table_name == "verifications":
+                st = entry.get("status", "")
+                if st and st not in _schema.VALID_STATUSES:
+                    errors.append(
+                        f"Line {line_no}: invalid status '{st}' "
+                        f"(expected: {', '.join(sorted(_schema.VALID_STATUSES))})"
+                    )
+            if table_name == "approvals":
+                dec = entry.get("decision", "")
+                if dec and dec not in _schema.VALID_DECISIONS:
+                    errors.append(
+                        f"Line {line_no}: invalid decision '{dec}' "
+                        f"(expected: {', '.join(sorted(_schema.VALID_DECISIONS))})"
+                    )
+
+        ids_by_table[table_name] = ids_seen
+        if errors:
+            all_errors[filename] = errors
+
+    # Cross-file referential integrity
+    ref_errors: list[str] = []
+    criteria_ids = ids_by_table.get("acceptance_criteria", set())
+    verification_ids = ids_by_table.get("verifications", set())
+
+    for entry in read_jsonl(p.verifications_file):
+        cid = entry.get("criteria_id", "")
+        if cid and cid not in criteria_ids:
+            ref_errors.append(
+                f"verifications: '{entry.get('id')}' references unknown criteria_id '{cid}'"
+            )
+
+    for entry in read_jsonl(p.approvals_file):
+        vid = entry.get("verification_id", "")
+        if vid and vid not in verification_ids:
+            ref_errors.append(
+                f"approvals: '{entry.get('id')}' references unknown verification_id '{vid}'"
+            )
+
+    if ref_errors:
+        all_errors["_referential_integrity"] = ref_errors
+
+    return all_errors
