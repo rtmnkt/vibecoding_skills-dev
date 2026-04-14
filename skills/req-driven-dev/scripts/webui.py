@@ -263,17 +263,23 @@ def show_add_requirement_dialog(refresh_fn) -> None:
         ui.label("Add Requirement").classes("text-lg font-bold")
 
         files = state_db.list_requirement_files()
+        new_file_option = "(new)"
+        default_file = files[0] if files else new_file_option
         file_input = ui.select(
             label="Requirement file",
-            options=files + ["(new)"],
+            options=files + [new_file_option],
+            value=default_file,
         ).classes("w-full")
         new_file_input = ui.input(
             label="New file name (e.g. 0006)",
         ).classes("w-full")
-        new_file_input.set_visibility(False)
+        new_file_input.set_visibility(default_file == new_file_option)
 
         def on_file_change(e):
-            new_file_input.set_visibility(e.value == "(new)")
+            is_new_file = e.value == new_file_option
+            new_file_input.set_visibility(is_new_file)
+            if not is_new_file:
+                new_file_input.value = ""
 
         file_input.on("update:model-value", on_file_change)
 
@@ -285,16 +291,22 @@ def show_add_requirement_dialog(refresh_fn) -> None:
         with ui.row().classes("w-full justify-end gap-2"):
 
             async def do_add():
-                f = file_input.value
-                if f == "(new)":
-                    f = new_file_input.value.strip()
-                if not f or not text_input.value.strip():
-                    ui.notify("File and text are required", type="warning")
+                selected_file = (file_input.value or "").strip()
+                requirement_text = (text_input.value or "").strip()
+                effective_file = (
+                    (new_file_input.value or "").strip()
+                    if selected_file == new_file_option
+                    else selected_file
+                )
+
+                if not effective_file:
+                    ui.notify("Requirement file is required", type="warning")
+                    return
+                if not requirement_text:
+                    ui.notify("Requirement text is required", type="warning")
                     return
                 try:
-                    entry = state_db.add_requirement(
-                        f, text_input.value.strip()
-                    )
+                    entry = state_db.add_requirement(effective_file, requirement_text)
                     ui.notify(
                         f"Added: {entry['id']} ({entry['file']}#{entry['req_no']})",
                         type="positive",
