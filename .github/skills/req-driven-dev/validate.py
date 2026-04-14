@@ -6,12 +6,12 @@
 Requirements / specs / state validator.
 
 Validates:
-  - .local/requirements/*.md  — body-only format (numbered requirements)
-  - .local/specs/*.md          — YAML front matter (requirement, commits, files)
-  - .local/state/*.jsonl       — JSONL schema validation
+  - .local/skills_req-driven-dev/*.jsonl  — JSONL schema validation (default)
+  - .local/requirements/*.md              — legacy body format (explicit only)
+  - .local/specs/*.md                     — legacy YAML front matter (explicit only)
 
 Usage:
-    uv run .github/skills/req-driven-dev/validate.py          # validate all
+    uv run .github/skills/req-driven-dev/validate.py          # validate JSONL state
     uv run .github/skills/req-driven-dev/validate.py FILE...  # validate specific files
 """
 
@@ -116,6 +116,20 @@ def validate_spec(path: Path) -> list[str]:
 
 
 JSONL_SCHEMAS: dict[str, dict[str, type]] = {
+    "requirements": {
+        "id": str,
+        "file": str,
+        "req_no": int,
+        "text": str,
+        "created_at": str,
+    },
+    "specs": {
+        "id": str,
+        "requirement": str,
+        "title": str,
+        "body": str,
+        "created_at": str,
+    },
     "acceptance_criteria": {
         "id": str,
         "requirement": str,
@@ -139,6 +153,11 @@ JSONL_SCHEMAS: dict[str, dict[str, type]] = {
     },
 }
 
+# Unique key constraints: schema_name -> list of key fields
+UNIQUE_KEYS: dict[str, list[tuple[str, ...]]] = {
+    "requirements": [("file", "req_no")],
+}
+
 VALID_STATUSES = {"passed", "failed", "conditional", "regression"}
 VALID_DECISIONS = {"approved", "rejected"}
 
@@ -152,6 +171,11 @@ def validate_jsonl(path: Path) -> list[str]:
 
     text = path.read_text(encoding="utf-8")
     ids_seen: set[str] = set()
+    composite_keys_seen: dict[tuple[str, ...], set[tuple]] = {}
+
+    # Initialize composite key tracking
+    for key_fields in UNIQUE_KEYS.get(schema_name, []):
+        composite_keys_seen[key_fields] = set()
 
     for line_no, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -183,6 +207,16 @@ def validate_jsonl(path: Path) -> list[str]:
             errors.append(f"Line {line_no}: Duplicate ID '{eid}'")
         ids_seen.add(eid)
 
+        # Check composite unique keys
+        for key_fields, seen in composite_keys_seen.items():
+            key_val = tuple(entry.get(k) for k in key_fields)
+            if all(v is not None for v in key_val):
+                if key_val in seen:
+                    errors.append(
+                        f"Line {line_no}: Duplicate key {dict(zip(key_fields, key_val))}"
+                    )
+                seen.add(key_val)
+
         # Check status values
         if schema_name == "verifications":
             status = entry.get("status", "")
@@ -209,13 +243,9 @@ def main() -> int:
     if len(sys.argv) > 1:
         paths = [Path(p) for p in sys.argv[1:]]
     else:
+        # Default: validate JSONL state files only
         paths = []
-        for subdir in ("requirements", "specs"):
-            d = LOCAL_DIR / subdir
-            if d.exists():
-                paths.extend(sorted(d.glob("*.md")))
-        # Also validate JSONL state files
-        state_dir = LOCAL_DIR / "state"
+        state_dir = LOCAL_DIR / "skills_req-driven-dev"
         if state_dir.exists():
             paths.extend(sorted(state_dir.glob("*.jsonl")))
 
@@ -225,7 +255,7 @@ def main() -> int:
             errs = validate_requirement(path)
         elif parent == "specs":
             errs = validate_spec(path)
-        elif parent == "state" and path.suffix == ".jsonl":
+        elif path.suffix == ".jsonl":
             errs = validate_jsonl(path)
         else:
             continue
@@ -241,7 +271,7 @@ def main() -> int:
                 print(f"  {filepath}: {e}", file=sys.stderr)
         return 1
     else:
-        validated = sum(1 for p in paths if p.parent.name in ("requirements", "specs", "state"))
+        validated = len([p for p in paths if p.suffix in (".jsonl", ".md")])
         print(f"✓ {validated} file(s) valid.")
         return 0
 

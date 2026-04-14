@@ -6,9 +6,6 @@
 
 要件ファイルと仕様メモによるエージェント協調開発ワークフロー。
 
-- `.local/requirements/` — 要件定義（WHAT）。ユーザーが記述。
-- `.local/specs/` — 仕様メモ（HOW/WHY）。エージェントが記述。
-- `.local/state/` — 受け入れ条件・検証・承認の JSONL 状態ファイル。
 - `.github/skills/req-driven-dev/` — スキル定義・リファレンス・CLIツール。
 
 ### CLI ツール

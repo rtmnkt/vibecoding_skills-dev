@@ -63,13 +63,13 @@ def find_repo_root() -> Path:
 def get_paths(repo_root: Path | None = None) -> Paths:
     root = repo_root or find_repo_root()
     local = root / ".local"
-    state = local / "state"
+    state = local / "skills_req-driven-dev"
     return Paths(
         repo_root=root,
         local_dir=local,
         state_dir=state,
-        requirements_dir=local / "requirements",
-        specs_dir=local / "specs",
+        requirements_dir=local / "requirements",   # migration-only
+        specs_dir=local / "specs",                  # migration-only
         criteria_file=state / "acceptance_criteria.jsonl",
         verifications_file=state / "verifications.jsonl",
         approvals_file=state / "approvals.jsonl",
@@ -153,7 +153,7 @@ def hash_text(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Legacy .md / .specs parsing (read-only, for migration)
+# Legacy .md parsing (migration-only — not used in normal operation)
 # ---------------------------------------------------------------------------
 
 
@@ -222,15 +222,6 @@ def query_full_status(req_file: str | None = None) -> list[dict]:
     req_texts: dict[tuple[str, int], str] = {}
     for r in read_jsonl(p.requirements_file):
         req_texts[(r["file"], r["req_no"])] = r["text"]
-
-    # Fallback: load from legacy .md files for any missing
-    if p.requirements_dir.exists():
-        for md_file in p.requirements_dir.glob("*.md"):
-            body = parse_requirement_body(md_file)
-            for req_no, text in body.items():
-                key = (md_file.stem, req_no)
-                if key not in req_texts:
-                    req_texts[key] = text
 
     # DuckDB query: join criteria + latest verification + latest approval
     criteria_path = _duckdb_path(p.criteria_file)
@@ -338,27 +329,7 @@ def query_specs() -> list[dict]:
     """Query all specs from specs.jsonl."""
     p = _get_paths()
     ensure_state_dir()
-    specs = read_jsonl(p.specs_file)
-
-    # Also load legacy specs if specs.jsonl is empty or as supplement
-    if p.specs_dir.exists():
-        existing_reqs = {s.get("requirement") for s in specs}
-        for md_file in sorted(p.specs_dir.glob("*.md")):
-            fm = parse_spec_frontmatter(md_file)
-            if fm and fm["requirement"] not in existing_reqs:
-                specs.append(
-                    {
-                        "id": f"spec-{md_file.stem}",
-                        "requirement": fm["requirement"],
-                        "commits": fm["commits"],
-                        "files": fm["files"],
-                        "title": md_file.stem,
-                        "body": fm["body"],
-                        "created_at": "",
-                        "created_by": "legacy",
-                    }
-                )
-    return specs
+    return read_jsonl(p.specs_file)
 
 
 def build_dependency_graph() -> dict[str, Any]:
@@ -496,29 +467,10 @@ def generate_mermaid(graph: dict | None = None) -> str:
 
 
 def list_requirements(file: str | None = None) -> list[dict]:
-    """List all requirements from requirements.jsonl (+ legacy .md fallback)."""
+    """List all requirements from requirements.jsonl."""
     p = _get_paths()
     ensure_state_dir()
     reqs = read_jsonl(p.requirements_file)
-
-    # Supplement from legacy .md
-    existing_keys = {(r["file"], r["req_no"]) for r in reqs}
-    if p.requirements_dir.exists():
-        for md_file in sorted(p.requirements_dir.glob("*.md")):
-            body = parse_requirement_body(md_file)
-            for req_no, text in sorted(body.items()):
-                key = (md_file.stem, req_no)
-                if key not in existing_keys:
-                    reqs.append(
-                        {
-                            "id": f"req-{md_file.stem}-{req_no}",
-                            "file": md_file.stem,
-                            "req_no": req_no,
-                            "text": text,
-                            "created_at": "",
-                            "created_by": "legacy",
-                        }
-                    )
 
     if file:
         file = file.replace(".md", "")
@@ -537,13 +489,7 @@ def add_requirement(file: str, text: str, by: str = "user") -> dict:
     existing = [
         r for r in read_jsonl(p.requirements_file) if r["file"] == file
     ]
-    # Also check legacy .md
-    md_path = p.requirements_dir / f"{file}.md"
-    legacy_nos = set()
-    if md_path.exists():
-        legacy_nos = set(parse_requirement_body(md_path).keys())
-
-    all_nos = {r["req_no"] for r in existing} | legacy_nos
+    all_nos = {r["req_no"] for r in existing}
     max_no = max(all_nos) if all_nos else 0
     new_no = max_no + 10
 
@@ -561,14 +507,11 @@ def add_requirement(file: str, text: str, by: str = "user") -> dict:
 
 
 def list_requirement_files() -> list[str]:
-    """List unique requirement file names (from both JSONL and legacy .md)."""
+    """List unique requirement file names from requirements.jsonl."""
     p = _get_paths()
     files: set[str] = set()
     for r in read_jsonl(p.requirements_file):
         files.add(r["file"])
-    if p.requirements_dir.exists():
-        for md in p.requirements_dir.glob("*.md"):
-            files.add(md.stem)
     return sorted(files)
 
 

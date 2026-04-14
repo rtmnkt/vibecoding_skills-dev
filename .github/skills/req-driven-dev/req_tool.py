@@ -45,6 +45,7 @@ import state_db
 
 
 def extract_front_matter(text: str) -> dict | None:
+    """Parse YAML front matter from legacy .md files (migration-only)."""
     import yaml
 
     match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
@@ -57,8 +58,8 @@ def extract_front_matter(text: str) -> dict | None:
         return None
 
 
-def resolve_req_file(name: str) -> Path:
-    """Resolve requirement file by number (e.g. '0001') or path."""
+def _resolve_req_file_md(name: str) -> Path:
+    """Resolve legacy requirement .md file by number (migration-only)."""
     if not name.endswith(".md"):
         name = f"{name}.md"
     p = state_db.get_paths().requirements_dir / name
@@ -68,20 +69,35 @@ def resolve_req_file(name: str) -> Path:
     return p
 
 
+def resolve_req_file(name: str) -> str:
+    """Resolve requirement file name and verify it exists in JSONL."""
+    name = name.replace(".md", "")
+    reqs = state_db.list_requirements(name)
+    if not reqs:
+        print(
+            f"✗ Requirement file '{name}' not found in JSONL. "
+            f"If you have legacy .md files, run 'migrate' first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return name
+
+
 def cmd_criteria_add(args) -> None:
     state_db.ensure_state_dir()
-    req_path = resolve_req_file(args.req_file)
-    body = state_db.parse_requirement_body(req_path)
-    if args.req_no not in body:
+    req_name = resolve_req_file(args.req_file)
+    reqs = state_db.list_requirements(req_name)
+    req_nos = {r["req_no"] for r in reqs}
+    if args.req_no not in req_nos:
         print(
-            f"✗ Requirement {args.req_no} not found in {req_path.name}",
+            f"✗ Requirement {args.req_no} not found in {req_name}",
             file=sys.stderr,
         )
         sys.exit(1)
 
     try:
         entry = state_db.add_criteria(
-            req_path.stem,
+            req_name,
             args.req_no,
             args.criterion,
             getattr(args, "by", "agent") or "agent",
@@ -111,14 +127,15 @@ def cmd_criteria_list(args) -> None:
         print("(no criteria found)")
         return
 
+    # Build requirement text lookup from JSONL for stale detection
+    reqs = state_db.list_requirements()
+    req_texts = {(r["file"], r["req_no"]): r["text"] for r in reqs}
+
     for c in criteria:
         stale = ""
-        req_path = p.requirements_dir / f"{c['requirement']}.md"
-        if req_path.exists():
-            body = state_db.parse_requirement_body(req_path)
-            current_text = body.get(c["req_no"], "")
-            if state_db.hash_text(current_text) != c.get("req_text_hash", ""):
-                stale = " ⚠️ stale"
+        current_text = req_texts.get((c["requirement"], c["req_no"]), "")
+        if current_text and state_db.hash_text(current_text) != c.get("req_text_hash", ""):
+            stale = " ⚠️ stale"
         print(
             f"  {c['id']}: [{c['requirement']}#{c['req_no']}] "
             f"{c['criterion']}{stale}"
@@ -157,13 +174,13 @@ def cmd_approve(args) -> None:
 
 def cmd_regress(args) -> None:
     state_db.ensure_state_dir()
-    req_path = resolve_req_file(args.req_file)
+    req_name = resolve_req_file(args.req_file)
     p = state_db.get_paths()
     criteria = state_db.read_jsonl(p.criteria_file)
     matching = [
         c
         for c in criteria
-        if c["requirement"] == req_path.stem and c["req_no"] == args.req_no
+        if c["requirement"] == req_name and c["req_no"] == args.req_no
     ]
 
     if args.criteria_id:
@@ -171,17 +188,17 @@ def cmd_regress(args) -> None:
         if target is None:
             print(f"✗ Criteria {args.criteria_id} not found", file=sys.stderr)
             sys.exit(1)
-        if target["requirement"] != req_path.stem or target["req_no"] != args.req_no:
+        if target["requirement"] != req_name or target["req_no"] != args.req_no:
             print(
                 f"✗ Criteria {args.criteria_id} belongs to "
                 f"{target['requirement']}#{target['req_no']}, "
-                f"not {req_path.stem}#{args.req_no}",
+                f"not {req_name}#{args.req_no}",
                 file=sys.stderr,
             )
             sys.exit(1)
     elif len(matching) > 1:
         print(
-            f"✗ Multiple criteria for {req_path.stem}#{args.req_no}. "
+            f"✗ Multiple criteria for {req_name}#{args.req_no}. "
             f"Specify one with --criteria-id:",
             file=sys.stderr,
         )
@@ -192,7 +209,7 @@ def cmd_regress(args) -> None:
     auto_created = not args.criteria_id and not matching
     try:
         entry = state_db.regress(
-            req_path.stem,
+            req_name,
             args.req_no,
             args.detail,
             args.criteria_id,
@@ -204,7 +221,7 @@ def cmd_regress(args) -> None:
 
     if auto_created:
         print(f"  (auto-created {entry['criteria_id']} from requirement text)")
-    print(f"✓ Regression {entry['id']}: [{req_path.stem}#{args.req_no}] {args.detail}")
+    print(f"✓ Regression {entry['id']}: [{req_name}#{args.req_no}] {args.detail}")
 
 
 def cmd_status(args) -> None:
@@ -341,8 +358,11 @@ def cmd_migrate(args) -> None:
     p = state_db.get_paths()
 
     if args.req_file:
-        files = [resolve_req_file(args.req_file)]
+        files = [_resolve_req_file_md(args.req_file)]
     else:
+        if not p.requirements_dir.exists():
+            print("  ⏭ No .local/requirements/ directory found. Nothing to migrate.")
+            return
         files = sorted(p.requirements_dir.glob("*.md"))
 
     existing_criteria = state_db.read_jsonl(p.criteria_file)
