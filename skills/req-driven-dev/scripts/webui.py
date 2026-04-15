@@ -61,20 +61,86 @@ def _effective_status(row: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_data(req_filter: str | None = None) -> tuple[list[dict], dict]:
+def _load_data(req_filter: str | None = None) -> tuple[dict[str, dict[int, dict]], dict]:
+    requirements = state_db.list_requirements(req_filter)
     rows = state_db.query_full_status(req_filter)
-    summary = state_db.compute_summary(rows)
-    return rows, summary
+    grouped = _group_by_file(requirements, rows)
+    summary = _compute_summary(grouped)
+    return grouped, summary
 
 
-def _group_by_file(rows: list[dict]) -> dict[str, dict[int, list[dict]]]:
-    """Group rows by file → req_no → list of criteria."""
-    grouped: dict[str, dict[int, list[dict]]] = {}
-    for r in rows:
-        f = r["requirement"]
-        n = r["req_no"]
-        grouped.setdefault(f, {}).setdefault(n, []).append(r)
+def _group_by_file(
+    requirements: list[dict], rows: list[dict]
+) -> dict[str, dict[int, dict]]:
+    """Group requirements by file → req_no and attach criteria rows."""
+    criteria_by_key: dict[tuple[str, int], list[dict]] = {}
+    for row in rows:
+        criteria_by_key.setdefault((row["requirement"], row["req_no"]), []).append(row)
+
+    grouped: dict[str, dict[int, dict]] = {}
+    for req in requirements:
+        f = req["file"]
+        n = req["req_no"]
+        grouped.setdefault(f, {})[n] = {
+            "req_text": req["text"],
+            "criteria": criteria_by_key.get((f, n), []),
+        }
     return grouped
+
+
+def _requirement_status(req_data: dict) -> str:
+    criteria = req_data["criteria"]
+    if not criteria:
+        return "none"
+    if any(c.get("is_stale") for c in criteria):
+        return "stale"
+    if any(c.get("v_status") == "regression" for c in criteria):
+        return "regression"
+    if any(c.get("v_status") == "failed" for c in criteria):
+        return "failed"
+    if all(_effective_status(c) == "approved" for c in criteria):
+        return "approved"
+    return "pending"
+
+
+def _compute_summary(grouped: dict[str, dict[int, dict]]) -> dict[str, int]:
+    """Compute dashboard summary counts from visible requirements."""
+    summary = {
+        "total": 0,
+        "approved": 0,
+        "pending": 0,
+        "failed": 0,
+        "regression": 0,
+        "stale": 0,
+        "no_verification": 0,
+    }
+    for reqs in grouped.values():
+        for req_data in reqs.values():
+            summary["total"] += 1
+            status = _requirement_status(req_data)
+            if status == "approved":
+                summary["approved"] += 1
+            elif status == "failed":
+                summary["failed"] += 1
+            elif status == "regression":
+                summary["regression"] += 1
+            elif status == "stale":
+                summary["stale"] += 1
+            else:
+                summary["pending"] += 1
+                if status == "none":
+                    summary["no_verification"] += 1
+    return summary
+
+
+def _matches_filter_status(status: str, f: str) -> bool:
+    if f == "all":
+        return True
+    if f == "pending":
+        return status in ("pending", "none")
+    if f == "problems":
+        return status in ("failed", "regression", "stale")
+    return status == f
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +179,7 @@ def _stat_card(label: str, value: int, color: str) -> None:
 
 def build_requirement_cards(
     container,
-    grouped: dict[str, dict[int, list[dict]]],
+    grouped: dict[str, dict[int, dict]],
     status_filter: str,
     refresh_fn,
 ) -> None:
@@ -128,22 +194,25 @@ def build_requirement_cards(
                 ui.separator()
 
                 for req_no in sorted(reqs.keys()):
-                    criteria = reqs[req_no]
-                    # Filter
-                    if status_filter != "all":
-                        criteria = [
-                            c
-                            for c in criteria
-                            if _matches_filter(c, status_filter)
-                        ]
-                    if not criteria:
+                    req_data = reqs[req_no]
+                    req_status = _requirement_status(req_data)
+                    if not _matches_filter_status(req_status, status_filter):
                         continue
 
-                    req_text = criteria[0].get("req_text", "")
+                    criteria = req_data["criteria"]
+                    visible_criteria = (
+                        criteria
+                        if status_filter == "all"
+                        else [c for c in criteria if _matches_filter(c, status_filter)]
+                    )
+                    req_text = req_data["req_text"]
                     with ui.column().classes("w-full ml-2 mb-3"):
                         with ui.row().classes("w-full items-center gap-2"):
                             ui.label(f"{req_no}. {req_text}").classes(
                                 "font-medium text-md flex-grow"
+                            )
+                            ui.badge(BADGE_LABELS[req_status]).style(
+                                f"background:{STATUS_COLORS[req_status]}"
                             )
                             fn = file_name
                             rn = req_no
@@ -155,19 +224,18 @@ def build_requirement_cards(
                             ).props("dense flat size=xs color=grey"
                             ).classes("text-xs")
 
-                        for crit in criteria:
+                        if not criteria:
+                            ui.label("No acceptance criteria defined").classes(
+                                "text-sm text-gray-400 ml-4"
+                            )
+                            continue
+
+                        for crit in visible_criteria:
                             _build_criterion_row(crit, refresh_fn)
 
 
 def _matches_filter(row: dict, f: str) -> bool:
-    s = _effective_status(row)
-    if f == "all":
-        return True
-    if f == "pending":
-        return s in ("pending", "none")
-    if f == "problems":
-        return s in ("failed", "regression", "stale")
-    return s == f
+    return _matches_filter_status(_effective_status(row), f)
 
 
 def _build_criterion_row(crit: dict, refresh_fn) -> None:
@@ -374,9 +442,8 @@ def create_page() -> None:
             return
         _refreshing["value"] = True
         try:
-            rows, summary = _load_data()
+            grouped, summary = _load_data()
             build_summary_bar(summary_container, summary)
-            grouped = _group_by_file(rows)
             build_requirement_cards(
                 cards_container, grouped, current_filter["value"], refresh
             )
